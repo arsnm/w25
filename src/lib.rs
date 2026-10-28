@@ -3,14 +3,33 @@
 #![deny(unsafe_code)]
 #![warn(missing_docs)]
 
-use core::{fmt::Debug, marker::PhantomData};
+use core::{convert::Infallible, fmt::Debug, marker::PhantomData};
 use derive_more::TryFrom;
-use embassy_futures::yield_now;
-use embedded_hal::digital::{OutputPin, PinState};
-use embedded_hal_async::spi::SpiDevice;
-use embedded_storage::nor_flash::{ErrorType, NorFlashError, NorFlashErrorKind};
+use embedded_hal::digital::{ErrorType, OutputPin, PinState};
 
-mod commands_impl;
+#[cfg(feature = "async")]
+mod commands_async;
+
+#[cfg(feature = "blocking")]
+mod commands_blocking;
+
+pub struct NoPin {}
+
+impl ErrorType for NoPin {
+    type Error = Infallible;
+}
+
+impl OutputPin for NoPin {
+    fn set_low(&mut self) -> Result<(), Self::Error> {
+        Ok(())
+    }
+    fn set_high(&mut self) -> Result<(), Self::Error> {
+        Ok(())
+    }
+    fn set_state(&mut self, _state: PinState) -> Result<(), Self::Error> {
+        Ok(())
+    }
+}
 
 /// The Q series
 pub struct Q;
@@ -61,10 +80,10 @@ enum Command {
 
 /// Low level driver for the w25 flash memory chip.
 pub struct W25<Series, SPI, HOLD, WP> {
-    spi: SPI,
-    hold: HOLD,
-    wp: WP,
-    capacity: u32,
+    pub(crate) spi: SPI,
+    pub(crate) hold: HOLD,
+    pub(crate) wp: WP,
+    pub(crate) capacity: u32,
     _pantom: PhantomData<Series>,
 }
 
@@ -74,99 +93,47 @@ impl<Series: NorSeries, SPI, HOLD, WP> W25<Series, SPI, HOLD, WP> {
         self.capacity
     }
 
-    fn n_sectors(&self) -> u32 {
+    pub(crate) fn n_sectors(&self) -> u32 {
         self.capacity / Series::SECTOR_SIZE
     }
 
-    fn n_blocks_32k(&self) -> u32 {
+    pub(crate) fn n_blocks_32k(&self) -> u32 {
         self.capacity / 32768
     }
 
-    fn n_blocks_64k(&self) -> u32 {
+    pub(crate) fn n_blocks_64k(&self) -> u32 {
         self.capacity / 65536
     }
-}
 
-impl<Series: NorSeries, SPI, S: Debug, P: Debug, HOLD, WP> W25<Series, SPI, HOLD, WP>
-where
-    SPI: embedded_hal::spi::ErrorType<Error = S> + embedded_hal_async::spi::SpiDevice,
-    HOLD: OutputPin<Error = P>,
-    WP: OutputPin<Error = P>,
-{
-    /// Create a new instance of the flash.
-    ///
-    /// The capacity must be the total chip capacity in bytes.
-    /// Weird things can happen if you provide the wrong value.
-    /// No checks are done, you're believed at your word.
-    pub async fn new(spi: SPI, hold: HOLD, wp: WP, capacity: u32) -> Result<Self, InitError<S, P>> {
-        let mut flash = W25 {
-            spi,
-            hold,
-            wp,
-            capacity,
-            _pantom: PhantomData,
-        };
-
-        flash.hold.set_high().map_err(InitError::PinError)?;
-        flash.wp.set_high().map_err(InitError::PinError)?;
-
-        // Ensure the device is not busy from before a MCU restart
-        while flash.busy().await? {
-            // Avoid starving the executor when the SPI is
-            // fast enough for the busy check to not yield
-            yield_now().await;
+    #[inline]
+    pub(crate) fn check_read<S: Debug>(&self, offset: u32, len: usize) -> Result<(), Error<S>> {
+        if offset.saturating_add(len as u32) > self.capacity {
+            Err(Error::OutOfBounds)
+        } else {
+            Ok(())
         }
-
-        Ok(flash)
     }
 
-    /// Set the hold pin state.
-    ///
-    /// The driver doesn't do anything with this pin. When using the chip, make sure the hold pin is not asserted.
-    /// By default this means the pin needs to be high (true).
-    ///
-    /// This function sets the pin directly and can cause the chip to not work.
-    pub fn set_hold(&mut self, value: PinState) -> Result<(), P> {
-        self.hold.set_state(value)
-    }
-
-    /// Set the write protect pin state.
-    ///
-    /// The driver doesn't do anything with this pin. When using the chip, make sure the hold pin is not asserted.
-    /// By default this means the pin needs to be high (true).
-    ///
-    /// This function sets the pin directly and can cause the chip to not work.
-    pub fn set_wp(&mut self, value: PinState) -> Result<(), P> {
-        self.wp.set_state(value)
-    }
-}
-
-impl<Series: NorSeries, SPI, S: Debug> W25<Series, SPI, (), ()>
-where
-    SPI: embedded_hal::spi::ErrorType<Error = S> + embedded_hal_async::spi::SpiDevice,
-{
-    /// Create a new instance of the flash, but without the nHold and nWP pins.
-    ///
-    /// The capacity must be the total chip capacity.
-    /// Weird things can happen if you provide the wrong value.
-    /// No checks are done, you're believed at your word.
-    pub async fn new_no_pins(spi: SPI, capacity: u32) -> Result<Self, Error<S>> {
-        let mut flash = Self {
-            spi,
-            hold: (),
-            wp: (),
-            capacity,
-            _pantom: PhantomData,
-        };
-
-        // Ensure the device is not busy from before a MCU restart
-        while flash.busy().await? {
-            // Avoid starving the executor when the SPI is
-            // fast enough for the busy check to not yield
-            yield_now().await;
+    #[inline]
+    pub(crate) fn check_write<S: Debug>(&self, offset: u32, len: usize) -> Result<(), Error<S>> {
+        if offset.saturating_add(len as u32) > self.capacity {
+            Err(Error::OutOfBounds)
+        } else {
+            Ok(())
         }
+    }
 
-        Ok(flash)
+    #[inline]
+    pub(crate) fn check_erase<S: Debug>(&self, from: u32, to: u32) -> Result<(), Error<S>> {
+        if from > to || to > self.capacity {
+            Err(Error::OutOfBounds)
+        } else if !from.is_multiple_of(Series::SECTOR_SIZE)
+            || !to.is_multiple_of(Series::SECTOR_SIZE)
+        {
+            Err(Error::NotAligned)
+        } else {
+            Ok(())
+        }
     }
 }
 
@@ -191,56 +158,6 @@ impl<S: Debug, P: Debug> From<Error<S>> for InitError<S, P> {
     }
 }
 
-impl<Series: NorSeries, SPI, S: Debug, P: Debug, HOLD, WP> W25<Series, SPI, HOLD, WP>
-where
-    SPI: SpiDevice<Error = S>,
-    HOLD: OutputPin<Error = P>,
-    WP: OutputPin<Error = P>,
-{
-    /// Create a new instance of the flash, autodetecting the chip variant and capacity.
-    pub async fn new_autodetect(spi: SPI, hold: HOLD, wp: WP) -> Result<Self, InitError<S, P>> {
-        let mut flash = W25 {
-            spi,
-            hold,
-            wp,
-            capacity: 0, // For now do not set the capacity of the device, as we do not know yet.
-            _pantom: PhantomData,
-        };
-
-        flash.hold.set_high().map_err(InitError::PinError)?;
-        flash.wp.set_high().map_err(InitError::PinError)?;
-
-        let jedec_id = flash.jedec_id().await?;
-        let manufacturer = jedec_id.manufacturer();
-        if jedec_id.manufacturer() != JedecId::MANUFACTURER {
-            return Err(InitError::ManufacturerNotRecognized(manufacturer));
-        }
-
-        let major_device_id = jedec_id
-            .major_device_id()
-            .map_err(InitError::DeviceNotRecognized)?;
-
-        // Update the capacity.
-        flash.capacity = major_device_id.capacity();
-
-        // Ensure the device is not busy from before a MCU restart
-        while flash.busy().await? {
-            // Avoid starving the executor when the SPI is
-            // fast enough for the busy check to not yield
-            yield_now().await;
-        }
-
-        Ok(flash)
-    }
-}
-
-impl<Series: NorSeries, SPI, S: Debug, HOLD, WP> ErrorType for W25<Series, SPI, HOLD, WP>
-where
-    SPI: embedded_hal::spi::ErrorType<Error = S>,
-{
-    type Error = Error<S>;
-}
-
 /// Custom error type for the various errors that can be thrown by driver.
 /// Can be converted into a NorFlashError.
 #[derive(Debug)]
@@ -255,16 +172,6 @@ pub enum Error<S: Debug> {
     OutOfBounds,
     /// Setting the write enable bit failed for some reason
     WriteEnableFail,
-}
-
-impl<S: Debug> NorFlashError for Error<S> {
-    fn kind(&self) -> NorFlashErrorKind {
-        match self {
-            Error::NotAligned => NorFlashErrorKind::NotAligned,
-            Error::OutOfBounds => NorFlashErrorKind::OutOfBounds,
-            _ => NorFlashErrorKind::Other,
-        }
-    }
 }
 
 #[allow(clippy::identity_op)]
