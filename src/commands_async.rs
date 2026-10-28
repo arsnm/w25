@@ -1,12 +1,13 @@
 use super::*;
+use core::convert::Infallible;
 use embassy_futures::yield_now;
+use embedded_hal::digital::OutputPin;
 use embedded_hal_async::spi::{Operation, SpiDevice};
 use embedded_storage_async::nor_flash::{MultiwriteNorFlash, NorFlash, ReadNorFlash};
 
 impl<Series: NorSeries, SPI, S: Debug, HOLD, WP> ReadNorFlash for W25<Series, SPI, HOLD, WP>
 where
     SPI: SpiDevice<Error = S>,
-    S: Debug,
 {
     const READ_SIZE: usize = 1;
 
@@ -22,10 +23,8 @@ where
 impl<Series: NorSeries, SPI, S: Debug, HOLD, WP> NorFlash for W25<Series, SPI, HOLD, WP>
 where
     SPI: SpiDevice<Error = S>,
-    S: Debug,
 {
     const WRITE_SIZE: usize = 1;
-
     const ERASE_SIZE: usize = Series::SECTOR_SIZE as usize;
 
     async fn erase(&mut self, from: u32, to: u32) -> Result<(), Self::Error> {
@@ -44,13 +43,76 @@ where
 {
 }
 
+impl<Series: NorSeries, SPI, S: Debug, P: Debug, HOLD, WP> W25<Series, SPI, HOLD, WP>
+where
+    SPI: SpiDevice<Error = S>,
+    HOLD: OutputPin<Error = P>,
+    WP: OutputPin<Error = P>,
+{
+    /// Create a new instance of the flash.
+    ///
+    /// The capacity must be the total chip capacity in bytes.
+    /// Weird things can happen if you provide the wrong value.
+    /// No checks are done, you're believed at your word.
+    pub async fn new(spi: SPI, hold: HOLD, wp: WP, capacity: u32) -> Result<Self, InitError<S, P>> {
+        let mut flash = Self::_new(spi, hold, wp, capacity)?;
+
+        // Ensure the device is not busy from before a MCU restart
+        while flash.busy().await? {
+            // Avoid starving the executor when the SPI is
+            // fast enough for the busy check to not yield
+            yield_now().await;
+        }
+
+        Ok(flash)
+    }
+
+    /// Create a new instance of the flash, autodetecting the chip variant and
+    /// capacity.
+    pub async fn new_autodetect(spi: SPI, hold: HOLD, wp: WP) -> Result<Self, InitError<S, P>> {
+        let mut flash = Self::new(spi, hold, wp, 0).await?;
+
+        let jedec = flash.jedec_id().await?;
+        if jedec.manufacturer() != JedecId::MANUFACTURER {
+            return Err(InitError::ManufacturerNotRecognized(jedec.manufacturer()));
+        }
+
+        let major_id = jedec.major_device_id().map_err(InitError::DeviceNotRecognized)?;
+        flash.capacity = major_id.capacity();
+
+        Ok(flash)
+    }
+}
+
+impl<Series: NorSeries, SPI, S: Debug> W25<Series, SPI, NoPin, NoPin>
+where
+    SPI: SpiDevice<Error = S>,
+{
+    /// Create a new instance of the flash, but without the nHold and nWP pins.
+    ///
+    /// The capacity must be the total chip capacity.
+    /// Weird things can happen if you provide the wrong value.
+    /// No checks are done, you're believed at your word.
+    pub async fn new_no_pins(spi: SPI, capacity: u32) -> Result<Self, InitError<S, Infallible>> {
+        Self::new(spi, NoPin {}, NoPin {}, capacity).await
+    }
+
+    /// Create a new instance of the flash, autodetecting the chip variant and
+    /// capacity, but without the nHold and nWP pins.
+    pub async fn new_autodetect_no_pins(
+        spi: SPI,
+    ) -> Result<Self, InitError<S, Infallible>> {
+        Self::new_autodetect(spi, NoPin {}, NoPin {}).await
+    }
+}
+
+
 impl<Series: NorSeries, SPI, S: Debug, HOLD, WP> W25<Series, SPI, HOLD, WP>
 where
     SPI: SpiDevice<Error = S>,
 {
     async fn read_status_register(&mut self) -> Result<u8, Error<S>> {
-        let mut buf: [u8; 2] = [0; 2];
-        buf[0] = Command::ReadStatusRegister1 as u8;
+        let mut buf: [u8; 2] = [Command::ReadStatusRegister1 as u8; 2];
 
         self.spi
             .transfer_in_place(&mut buf)
@@ -60,8 +122,10 @@ where
         Ok(buf[1])
     }
 
-    /// The flash chip is unable to perform new commands while it is still working on a previous one. Especially erases take a long time.
-    /// This function returns true while the chip is unable to respond to commands (with the exception of the busy command).
+    /// The flash chip is unable to perform new commands while it is still
+    /// working on a previous one. Especially erases take a long time.
+    /// This function returns true while the chip is unable to respond to
+    /// commands (with the exception of the busy command).
     pub(crate) async fn busy(&mut self) -> Result<bool, Error<S>> {
         Ok((self.read_status_register().await? & 0x01) != 0)
     }
@@ -96,7 +160,7 @@ where
         Ok(JedecId(TryFrom::try_from(&buf[1..]).unwrap()))
     }
 
-    /// Reset the chip
+    /// Reset the chip.
     pub async fn reset(&mut self) -> Result<(), Error<S>>
     where
         Series: Reset,
@@ -113,16 +177,16 @@ where
     }
 
     /// Reads a chunk of bytes from the flash chip.
+    ///
     /// The number of bytes read is equal to the length of the buf slice.
-    /// The first byte is read from the provided address. This address is then incremented for each following byte.
+    /// The first byte is read from the provided address. This address is then
+    /// incremented for each following byte.
     ///
     /// # Arguments
     /// * `address` - Address where the first byte of the buf will be read.
     /// * `buf` - Slice that is going to be filled with the read bytes.
     pub async fn read(&mut self, address: u32, buf: &mut [u8]) -> Result<(), Error<S>> {
-        if address + buf.len() as u32 > self.capacity {
-            return Err(Error::OutOfBounds);
-        }
+        self.check_read(address, buf.len())?;
 
         self.spi
             .transaction(&mut [
@@ -136,8 +200,10 @@ where
     }
 
     /// Sets the enable_write flag on the flash chip to true.
+    ///
     /// Writes and erases to the chip only have effect when this flag is true.
-    /// Each write and erase clears the flag, requiring it to be set to true again for the next command.
+    /// Each write and erase clears the flag, requiring it to be set to true
+    /// again for the next command.
     async fn enable_write(&mut self) -> Result<(), Error<S>> {
         self.spi
             .write(&[Command::WriteEnable as u8])
@@ -152,23 +218,23 @@ where
     }
 
     /// Writes a chunk of bytes to the flash chip.
-    /// The first byte is written to the provided address. This address is then incremented for each following byte.
+    ///
+    /// The first byte is written to the provided address. This address is then
+    /// incremented for each following byte.
     ///
     /// # Arguments
     /// * `address` - Address where the first byte of the buf will be written.
     /// * `buf` - Slice of bytes that will be written.
     pub async fn write(&mut self, mut address: u32, mut buf: &[u8]) -> Result<(), Error<S>> {
-        if address + buf.len() as u32 > self.capacity {
-            return Err(Error::OutOfBounds);
-        }
+        self.check_write(address, buf.len())?;
 
         // Write first chunk, taking into account that given addres might
-        // point to a location that is not on a page boundary,
+        // point to a location that is not on a page boundary.
         let chunk_len = (Series::PAGE_SIZE - (address & 0x000000FF)) as usize;
         let chunk_len = chunk_len.min(buf.len());
         self.write_page(address, &buf[..chunk_len]).await?;
 
-        // Write rest of the chunks
+        // Write rest of the chunks.
         let mut chunk_len = chunk_len;
         loop {
             buf = &buf[chunk_len..];
@@ -183,9 +249,9 @@ where
         Ok(())
     }
 
-    /// Execute a write on a single page
+    /// Execute a write on a single page.
     async fn write_page(&mut self, address: u32, buf: &[u8]) -> Result<(), Error<S>> {
-        // We don't support wrapping writes. They're scary
+        // We don't support wrapping writes. They're scary.
         if (address & 0x000000FF) + buf.len() as u32 > Series::PAGE_SIZE {
             return Err(Error::OutOfBounds);
         }
@@ -202,37 +268,32 @@ where
 
         while self.busy().await? {
             // Avoid starving the executor when the SPI is
-            // fast enough for the busy check to not yield
+            // fast enough for the busy check to not yield.
             yield_now().await;
         }
 
         Ok(())
     }
 
-    /// Erases a range of sectors. The range is expressed in bytes. These bytes need to be a multiple of SECTOR_SIZE.
-    /// If the range starts at SECTOR_SIZE * 3 then the erase starts at the fourth sector.
-    /// All sectors are erased in the range [start_sector..end_sector].
-    /// The start address may not be a higher value than the end address.
+    /// Erases a range of sectors.
+    ///
+    /// The range is expressed in bytes. These bytes need to be a multiple of
+    /// SECTOR_SIZE. If the range starts at SECTOR_SIZE * 3 then the erase
+    /// starts at the fourth sector.All sectors are erased in the range
+    /// [start_sector..end_sector].  The start address may not be a higher value
+    /// than the end address.
     ///
     /// # Arguments
-    /// * `start_address` - Address of the first byte of the start of the range of sectors that need to be erased.
-    /// * `end_address` - Address of the first byte of the end of the range of sectors that need to be erased.
+    /// * `start_address` - Address of the first byte of the start of the range
+    ///   of sectors that need to be erased.
+    /// * `end_address` - Address of the first byte of the end of the range of
+    ///   sectors that need to be erased.
     pub async fn erase_range(
         &mut self,
         start_address: u32,
         end_address: u32,
     ) -> Result<(), Error<S>> {
-        if start_address % (Series::SECTOR_SIZE) != 0 {
-            return Err(Error::NotAligned);
-        }
-
-        if end_address % (Series::SECTOR_SIZE) != 0 {
-            return Err(Error::NotAligned);
-        }
-
-        if start_address > end_address {
-            return Err(Error::OutOfBounds);
-        }
+        self.check_erase(start_address, end_address)?;
 
         let start_sector = start_address / Series::SECTOR_SIZE;
         let end_sector = end_address / Series::SECTOR_SIZE;
@@ -247,7 +308,8 @@ where
     /// Erases a single sector of flash memory with the size of SECTOR_SIZE.
     ///
     /// # Arguments
-    /// * `index` - the index of the sector that needs to be erased. The address of the first byte of the sector is the provided index * SECTOR_SIZE.
+    /// * `index` - the index of the sector that needs to be erased. The address
+    ///   of the first byte of the sector is the provided index * SECTOR_SIZE.
     pub async fn erase_sector(&mut self, index: u32) -> Result<(), Error<S>> {
         if index >= self.n_sectors() {
             return Err(Error::OutOfBounds);
@@ -274,7 +336,8 @@ where
     /// Erases a single block of flash memory with the size of BLOCK_32K_SIZE.
     ///
     /// # Arguments
-    /// * `index` - the index of the block that needs to be erased. The address of the first byte of the block is the provided index * BLOCK_32K_SIZE.
+    /// * `index` - the index of the block that needs to be erased. The address
+    ///   of the first byte of the block is the provided index * BLOCK_32K_SIZE.
     pub async fn erase_block_32k(&mut self, index: u32) -> Result<(), Error<S>> {
         if index >= self.n_blocks_32k() {
             return Err(Error::OutOfBounds);
@@ -301,7 +364,8 @@ where
     /// Erases a single block of flash memory with the size of BLOCK_64K_SIZE.
     ///
     /// # Arguments
-    /// * `index` - the index of the block that needs to be erased. The address of the first byte of the block is the provided index * BLOCK_64K_SIZE.
+    /// * `index` - the index of the block that needs to be erased. The address
+    ///   of the first byte of the block is the provided index * BLOCK_64K_SIZE.
     pub async fn erase_block_64k(&mut self, index: u32) -> Result<(), Error<S>> {
         if index >= self.n_blocks_64k() {
             return Err(Error::OutOfBounds);
@@ -326,6 +390,7 @@ where
     }
 
     /// Erases all sectors on the flash chip.
+    ///
     /// This is a very expensive operation.
     pub async fn erase_chip(&mut self) -> Result<(), Error<S>> {
         self.enable_write().await?;
@@ -345,7 +410,10 @@ where
     }
 
     /// Puts the chip into power down mode.
-    /// While in the power-down state, only the Release Power-down/Device ID (0xAB) instruction will be recognized. This instruction restores the device to normal operation. All other instructions are ignored.
+    ///
+    /// While in the power-down state, only the Release Power-down/Device ID
+    /// (0xAB) instruction will be recognized. This instruction restores the
+    /// device to normal operation. All other instructions are ignored.
     pub async fn enable_power_down_mode(&mut self) -> Result<(), Error<S>> {
         self.spi
             .write(&[Command::PowerDown as u8])
@@ -356,7 +424,9 @@ where
     }
 
     /// Releases the chip from power down mode.
-    /// Restores operation from power down mode by reading the deviceID from the device.
+    ///
+    /// Restores operation from power down mode by reading the deviceID from the
+    /// device.
     pub async fn disable_power_down_mode(&mut self) -> Result<(), Error<S>> {
         self.spi
             .write(&[Command::ReleasePowerDown as u8])
